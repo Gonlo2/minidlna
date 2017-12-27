@@ -30,17 +30,22 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/time.h>
-#ifdef HAVE_INOTIFY
-#include <sys/resource.h>
-#include <poll.h>
-#ifdef HAVE_SYS_INOTIFY_H
-#include <sys/inotify.h>
-#else
-#include "linux/inotify.h"
-#include "linux/inotify-syscalls.h"
-#endif
-#endif
 #include "libav.h"
+
+#ifdef HAVE_INOTIFY
+  #include <sys/resource.h>
+  #include <poll.h>
+
+  #include<arpa/inet.h>
+  #include<sys/socket.h>
+
+  #ifdef HAVE_SYS_INOTIFY_H
+    #include <sys/inotify.h>
+  #else
+    #include "linux/inotify.h"
+    #include "linux/inotify-syscalls.h"
+  #endif
+#endif
 
 #include "upnpglobalvars.h"
 #include "monitor.h"
@@ -54,16 +59,9 @@
 
 static time_t next_pl_fill = 0;
 
-#ifdef HAVE_INOTIFY
-#define EVENT_SIZE  ( sizeof (struct inotify_event) )
-#define BUF_LEN     ( 1024 * ( EVENT_SIZE + 16 ) )
-#define DESIRED_WATCH_LIMIT 65536
-
-#define PATH_BUF_SIZE PATH_MAX
-
 struct watch
 {
-	int wd;		/* watch descriptor */
+	char *id;		/* watch id */
 	char *path;	/* watched path */
 	struct watch *next;
 };
@@ -72,13 +70,13 @@ static struct watch *watches;
 static struct watch *lastwatch = NULL;
 
 static char *
-get_path_from_wd(int wd)
+get_path_of_id(const char* id)
 {
 	struct watch *w = watches;
 
-	while( w != NULL )
+	while (w != NULL)
 	{
-		if( w->wd == wd )
+		if (strcmp(w->id, id) == 0)
 			return w->path;
 		w = w->next;
 	}
@@ -86,58 +84,16 @@ get_path_from_wd(int wd)
 	return NULL;
 }
 
-static unsigned int
-next_highest(unsigned int num)
-{
-	num |= num >> 1;
-	num |= num >> 2;
-	num |= num >> 4;
-	num |= num >> 8;
-	num |= num >> 16;
-	return ++num;
-}
-
-static void
-raise_watch_limit(unsigned int limit)
-{
-	FILE *max_watches = fopen("/proc/sys/fs/inotify/max_user_watches", "r+");
-	if (!max_watches)
-		return;
-	if (!limit)
-	{
-		if (fscanf(max_watches, "%10u", &limit) < 1)
-			limit = 8192;
-		rewind(max_watches);
-	}
-	fprintf(max_watches, "%u", next_highest(limit));
-	fclose(max_watches);
-}
-
 int
-add_watch(int fd, const char * path)
+add_watch(const char * path)
 {
-	struct watch *nw;
-	int wd;
-
-	wd = inotify_add_watch(fd, path, IN_CREATE|IN_CLOSE_WRITE|IN_DELETE|IN_MOVE);
-	if( wd < 0 && errno == ENOSPC)
-	{
-		raise_watch_limit(0);
-		wd = inotify_add_watch(fd, path, IN_CREATE|IN_CLOSE_WRITE|IN_DELETE|IN_MOVE);
-	}
-	if( wd < 0 )
-	{
-		DPRINTF(E_ERROR, L_INOTIFY, "inotify_add_watch(%s) [%s]\n", path, strerror(errno));
-		return (errno);
-	}
-
-	nw = malloc(sizeof(struct watch));
+	struct watch *nw = malloc(sizeof(struct watch));
 	if( nw == NULL )
 	{
 		DPRINTF(E_ERROR, L_INOTIFY, "malloc() error\n");
 		return (ENOMEM);
 	}
-	nw->wd = wd;
+	nw->id = basename(strdup(path));
 	nw->next = NULL;
 	nw->path = strdup(path);
 
@@ -152,108 +108,21 @@ add_watch(int fd, const char * path)
 	}
 	lastwatch = nw;
 
-	DPRINTF(E_INFO, L_INOTIFY, "Added watch to %s [%d]\n", path, wd);
+	DPRINTF(E_INFO, L_INOTIFY, "Added watch to %s [%s]\n", path, nw->id);
 	return (0);
 }
 
-static int
-remove_watch(int fd, const char * path)
+static void
+inotify_create_watches()
 {
-	struct watch *w;
-
-	for( w = watches; w; w = w->next )
-	{
-		if( strcmp(path, w->path) == 0 )
-			return(inotify_rm_watch(fd, w->wd));
-	}
-
-	return 1;
-}
-
-static int
-inotify_create_watches(int fd)
-{
-	FILE * max_watches;
-	unsigned int num_watches = 0, watch_limit;
-	char **result;
-	int i, rows = 0;
 	struct media_dir_s * media_path;
 
 	for( media_path = media_dirs; media_path != NULL; media_path = media_path->next )
 	{
 		DPRINTF(E_DEBUG, L_INOTIFY, "Add watch to %s\n", media_path->path);
-		add_watch(fd, media_path->path);
-		num_watches++;
-	}
-	sql_get_table(db, "SELECT PATH from DETAILS where MIME is NULL and PATH is not NULL", &result, &rows, NULL);
-	for( i=1; i <= rows; i++ )
-	{
-		DPRINTF(E_DEBUG, L_INOTIFY, "Add watch to %s\n", result[i]);
-		add_watch(fd, result[i]);
-		num_watches++;
-	}
-	sqlite3_free_table(result);
-		
-	max_watches = fopen("/proc/sys/fs/inotify/max_user_watches", "r");
-	if( max_watches )
-	{
-		if( fscanf(max_watches, "%10u", &watch_limit) < 1 )
-			watch_limit = 8192;
-		fclose(max_watches);
-		if( (watch_limit < DESIRED_WATCH_LIMIT) || (watch_limit < (num_watches*4/3)) )
-		{
-			if (access("/proc/sys/fs/inotify/max_user_watches", W_OK) == 0)
-			{
-				if( DESIRED_WATCH_LIMIT >= (num_watches*3/4) )
-				{
-					raise_watch_limit(8191U);
-				}
-				else if( next_highest(num_watches) >= (num_watches*3/4) )
-				{
-					raise_watch_limit(num_watches);
-				}
-				else
-				{
-					raise_watch_limit(next_highest(num_watches));
-				}
-			}
-			else
-			{
-				DPRINTF(E_WARN, L_INOTIFY, "WARNING: Inotify max_user_watches [%u] is low or close to the number of used watches [%u] "
-				                        "and I do not have permission to increase this limit.  Please do so manually by "
-				                        "writing a higher value into /proc/sys/fs/inotify/max_user_watches.\n", watch_limit, num_watches);
-			}
-		}
-	}
-	else
-	{
-		DPRINTF(E_WARN, L_INOTIFY, "WARNING: Could not read inotify max_user_watches!  "
-		                        "Hopefully it is enough to cover %u current directories plus any new ones added.\n", num_watches);
-	}
-
-	return rows;
+		add_watch(media_path->path);
+  }
 }
-
-static int
-inotify_remove_watches(int fd)
-{
-	struct watch *w = watches;
-	struct watch *last_w;
-	int rm_watches = 0;
-
-	while( w )
-	{
-		last_w = w;
-		inotify_rm_watch(fd, w->wd);
-		free(w->path);
-		rm_watches++;
-		w = w->next;
-		free(last_w);
-	}
-
-	return rm_watches;
-}
-#endif
 
 int
 monitor_remove_file(const char * path)
@@ -533,11 +402,6 @@ monitor_insert_directory(int fd, char *name, const char * path)
 		free(parent_buf);
 	}
 
-#ifdef HAVE_WATCH
-	if( fd > 0 )
-		add_watch(fd, path);
-#endif
-
 	dir_types = valid_media_types(path);
 
 	ds = opendir(path);
@@ -586,12 +450,6 @@ monitor_remove_directory(int fd, const char * path)
 
 	/* Invalidate the scanner cache so we don't insert files into non-existent containers */
 	valid_cache = 0;
-	#ifdef HAVE_INOTIFY
-	if( fd > 0 )
-	{
-		remove_watch(fd, path);
-	}
-	#endif
 	sql = sqlite3_mprintf("SELECT ID from DETAILS where (PATH > '%q/' and PATH <= '%q/%c')"
 	                      " or PATH = '%q'", path, path, 0xFF, path);
 	if( (sql_get_table(db, sql, &result, &rows, NULL) == SQLITE_OK) )
@@ -615,27 +473,39 @@ monitor_remove_directory(int fd, const char * path)
 	return ret;
 }
 
+#define SERVER "127.0.0.1"
+#define BUF_LEN 2048
+#define PORT 5555
+
 #ifdef HAVE_INOTIFY
 void *
-start_inotify(void)
+start_remote_inotify(void)
 {
-	struct pollfd pollfds[1];
-	char buffer[BUF_LEN];
-	char path_buf[PATH_MAX];
-	int length, i = 0;
-	char * esc_name = NULL;
-	struct stat st;
 	sigset_t set;
 
 	sigfillset(&set);
 	sigdelset(&set, SIGCHLD);
 	pthread_sigmask(SIG_BLOCK, &set, NULL);
 
-	pollfds[0].fd = inotify_init();
+	struct pollfd pollfds[1];
+	pollfds[0].fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
 	pollfds[0].events = POLLIN;
 
-	if ( pollfds[0].fd < 0 )
-		DPRINTF(E_ERROR, L_INOTIFY, "inotify_init() failed!\n");
+	if (pollfds[0].fd == -1)
+	{
+		DPRINTF(E_ERROR, L_INOTIFY, "create socket failed!\n");
+	}
+
+	struct sockaddr_in si_me;
+	memset((char *) &si_me, 0, sizeof(si_me));
+	si_me.sin_family = AF_INET;
+	si_me.sin_port = htons(PORT);
+	si_me.sin_addr.s_addr = htonl(INADDR_ANY);
+
+	if (bind(pollfds[0].fd, (struct sockaddr*) &si_me, sizeof(si_me)) == -1)
+	{
+		DPRINTF(E_ERROR, L_INOTIFY, "bind socket failed!\n");
+	}
 
 	while( GETFLAG(SCANNING_MASK) )
 	{
@@ -643,11 +513,22 @@ start_inotify(void)
 			goto quitting;
 		sleep(1);
 	}
-	inotify_create_watches(pollfds[0].fd);
+
+	inotify_create_watches();
+
 	if (setpriority(PRIO_PROCESS, 0, 19) == -1)
+	{
 		DPRINTF(E_WARN, L_INOTIFY,  "Failed to reduce inotify thread priority\n");
+	}
+
 	sqlite3_release_memory(1<<31);
 	lav_register_all();
+
+	char buffer[BUF_LEN];
+	char path_buf[PATH_MAX];
+
+	struct remote_inotify event;
+	struct stat st;
 
 	while( !quitting )
 	{
@@ -655,12 +536,10 @@ start_inotify(void)
 		if (next_pl_fill)
 		{
 			time_t diff = next_pl_fill - time(NULL);
-			if (diff < 0)
-				timeout = 0;
-			else
-				timeout = diff * 1000;
+			timeout = (diff < 0) ? 0 : diff * 1000;
 		}
-		length = poll(pollfds, 1, timeout);
+
+		int length = poll(pollfds, 1, timeout);
 		if( !length )
 		{
 			if( next_pl_fill && (time(NULL) >= next_pl_fill) )
@@ -680,71 +559,103 @@ start_inotify(void)
 		else
 		{
 			length = read(pollfds[0].fd, buffer, BUF_LEN);
-			buffer[BUF_LEN-1] = '\0';
 		}
 
-		i = 0;
-		while( !quitting && i < length )
+		if ( !parse_inotify_event(buffer, length, &event) )
 		{
-			struct inotify_event * event = (struct inotify_event *) &buffer[i];
-			if( event->len )
-			{
-				if( *(event->name) == '.' )
-				{
-					i += EVENT_SIZE + event->len;
-					continue;
-				}
-				esc_name = modifyString(strdup(event->name), "&", "&amp;amp;", 0);
-				snprintf(path_buf, sizeof(path_buf), "%s/%s", get_path_from_wd(event->wd), event->name);
-				if ( event->mask & IN_ISDIR && (event->mask & (IN_CREATE|IN_MOVED_TO)) )
-				{
-					DPRINTF(E_DEBUG, L_INOTIFY,  "The directory %s was %s.\n",
-						path_buf, (event->mask & IN_MOVED_TO ? "moved here" : "created"));
-					monitor_insert_directory(pollfds[0].fd, esc_name, path_buf);
-				}
-				else if ( (event->mask & (IN_CLOSE_WRITE|IN_MOVED_TO|IN_CREATE)) &&
-				          (lstat(path_buf, &st) == 0) )
-				{
-					if( (event->mask & (IN_MOVED_TO|IN_CREATE)) && (S_ISLNK(st.st_mode) || st.st_nlink > 1) )
-					{
-						DPRINTF(E_DEBUG, L_INOTIFY, "The %s link %s was %s.\n",
-							(S_ISLNK(st.st_mode) ? "symbolic" : "hard"),
-							path_buf, (event->mask & IN_MOVED_TO ? "moved here" : "created"));
-						if( stat(path_buf, &st) == 0 && S_ISDIR(st.st_mode) )
-							monitor_insert_directory(pollfds[0].fd, esc_name, path_buf);
-						else
-							monitor_insert_file(esc_name, path_buf);
-					}
-					else if( event->mask & (IN_CLOSE_WRITE|IN_MOVED_TO) && st.st_size > 0 )
-					{
-						if( (event->mask & IN_MOVED_TO) ||
-						    (sql_get_int_field(db, "SELECT TIMESTAMP from DETAILS where PATH = '%q'", path_buf) != st.st_mtime) )
-						{
-							DPRINTF(E_DEBUG, L_INOTIFY, "The file %s was %s.\n",
-								path_buf, (event->mask & IN_MOVED_TO ? "moved here" : "changed"));
-							monitor_insert_file(esc_name, path_buf);
-						}
-					}
-				}
-				else if ( event->mask & (IN_DELETE|IN_MOVED_FROM) )
-				{
-					DPRINTF(E_DEBUG, L_INOTIFY, "The %s %s was %s.\n",
-						(event->mask & IN_ISDIR ? "directory" : "file"),
-						path_buf, (event->mask & IN_MOVED_FROM ? "moved away" : "deleted"));
-					if ( event->mask & IN_ISDIR )
-						monitor_remove_directory(pollfds[0].fd, path_buf);
-					else
-						monitor_remove_file(path_buf);
-				}
-				free(esc_name);
+			DPRINTF(E_DEBUG, L_INOTIFY, "Received invalid inotify msg\n");
+			continue;
+		}
+
+		if (!((*event.path == 0) && (*event.name == 0)))
+		{
+			char* esc_name = modifyString(strdup(event.name), "&", "&amp;amp;", 0);
+			if (strcmp("", event.path) == 0) {
+				snprintf(path_buf, sizeof(path_buf), "%s/%s", get_path_of_id(event.id), event.name);
+			} else {
+				snprintf(path_buf, sizeof(path_buf), "%s/%s/%s", get_path_of_id(event.id), event.path, event.name);
 			}
-			i += EVENT_SIZE + event->len;
+
+			if ( event.mask & IN_ISDIR && (event.mask & (IN_CREATE|IN_MOVED_TO)) )
+			{
+				DPRINTF(E_DEBUG, L_INOTIFY,  "The directory %s was %s.\n",
+					path_buf, (event.mask & IN_MOVED_TO ? "moved here" : "created"));
+				monitor_insert_directory(pollfds[0].fd, esc_name, path_buf);
+			}
+			else if ( (event.mask & (IN_CLOSE_WRITE|IN_MOVED_TO|IN_CREATE)) && (lstat(path_buf, &st) == 0) )
+			{
+				if( (event.mask & (IN_MOVED_TO|IN_CREATE)) && (S_ISLNK(st.st_mode) || st.st_nlink > 1) )
+				{
+					DPRINTF(E_DEBUG, L_INOTIFY, "The %s link %s was %s.\n",
+						(S_ISLNK(st.st_mode) ? "symbolic" : "hard"),
+						path_buf, (event.mask & IN_MOVED_TO ? "moved here" : "created"));
+					if( stat(path_buf, &st) == 0 && S_ISDIR(st.st_mode) )
+						monitor_insert_directory(pollfds[0].fd, esc_name, path_buf);
+					else
+						monitor_insert_file(esc_name, path_buf);
+				}
+				else if( event.mask & (IN_CLOSE_WRITE|IN_MOVED_TO) && st.st_size > 0 )
+				{
+					if( (event.mask & IN_MOVED_TO) ||
+						(sql_get_int_field(db, "SELECT TIMESTAMP from DETAILS where PATH = '%q'", path_buf) != st.st_mtime) )
+					{
+						DPRINTF(E_DEBUG, L_INOTIFY, "The file %s was %s.\n",
+							path_buf, (event.mask & IN_MOVED_TO ? "moved here" : "changed"));
+						monitor_insert_file(esc_name, path_buf);
+					}
+				}
+			}
+			else if ( event.mask & (IN_DELETE|IN_MOVED_FROM) )
+			{
+				DPRINTF(E_DEBUG, L_INOTIFY, "The %s %s was %s.\n",
+					(event.mask & IN_ISDIR ? "directory" : "file"),
+					path_buf, (event.mask & IN_MOVED_FROM ? "moved away" : "deleted"));
+				if ( event.mask & IN_ISDIR )
+					monitor_remove_directory(pollfds[0].fd, path_buf);
+				else
+					monitor_remove_file(path_buf);
+			}
+			free(esc_name);
 		}
 	}
-	inotify_remove_watches(pollfds[0].fd);
 quitting:
-	close(pollfds[0].fd);
+	if (pollfds[0].fd != -1)
+	{
+		close(pollfds[0].fd);
+	}
 
 	return 0;
 }
+
+int
+parse_inotify_event(char *buffer, int size, struct remote_inotify *event)
+{
+	int i = 0;
+	uint8_t id_size = buffer[i++];
+	uint8_t name_size = buffer[i++];
+	uint16_t path_size = (buffer[i]<<8) | buffer[i+1]; i += 2;
+	event->mask = (buffer[i]<<24) | (buffer[i+1]<<16) | (buffer[i+2]<<8) | buffer[i+3]; i += 4;
+	event->cookie = (buffer[i]<<24) | (buffer[i+1]<<16) | (buffer[i+2]<<8) | buffer[i+3]; i += 4;
+	if (i + id_size + name_size + path_size + 4 > size) {
+		return 0;
+	}
+	event->id = &buffer[i]; i += id_size; buffer[i-1] = 0;
+	event->name = &buffer[i]; i += name_size; buffer[i-1] = 0;
+	event->path = &buffer[i]; i += path_size; buffer[i-1] = 0;
+	uint32_t crc = (buffer[i]<<24) | (buffer[i+1]<<16) | (buffer[i+2]<<8) | buffer[i+3];
+	return crc == crc32(buffer, i) ? 1 : 0;
+}
+
+uint32_t crc32(char *data, int size) {
+	uint32_t crc = 0xFFFFFFFFUL;
+	for (int i = 0; i < size; ++i) {
+		crc ^= (unsigned char) data[i];
+		for (int j = 8; j; --j) {
+			uint32_t mask = -(crc & 1);
+			crc = (crc >> 1) ^ (0xEDB88320UL & mask);
+		}
+	}
+	return crc ^ 0xFFFFFFFFUL;
+}
+
 #endif
