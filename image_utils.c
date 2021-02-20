@@ -137,7 +137,7 @@ init_source(j_decompress_ptr cinfo)
 	return;
 }
 
-static boolean
+static int
 fill_input_buffer(j_decompress_ptr cinfo)
 {
 	struct my_src_mgr *src = (void *)cinfo->src;

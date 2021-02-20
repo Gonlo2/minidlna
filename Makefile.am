@@ -15,7 +15,7 @@
 # Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307
 # USA.
 
-AM_CFLAGS = -Wall -D_LARGEFILE_SOURCE -D_FILE_OFFSET_BITS=64
+AM_CFLAGS = -Wall -D_LARGEFILE_SOURCE -D_FILE_OFFSET_BITS=64 @STATIC_CFLAGS@
 
 SUBDIRS=po
 
@@ -55,10 +55,13 @@ minidlnad_LDADD = \
 	@LIBID3TAG_LIBS@ \
 	@LIBSQLITE3_LIBS@ \
 	@LIBAVFORMAT_LIBS@ \
+	@LIBAVUTIL_LIBS@ \
 	@LIBEXIF_LIBS@ \
 	@LIBINTL@ \
 	@LIBICONV@ \
 	-lFLAC $(flacogglibs) $(vorbislibs) $(avahilibs)
+
+minidlnad_LDFLAGS = @STATIC_LDFLAGS@
 
 testupnpdescgen_SOURCES = testupnpdescgen.c upnpdescgen.c
 testupnpdescgen_LDADD = \
